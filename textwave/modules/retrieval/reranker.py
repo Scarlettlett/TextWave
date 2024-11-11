@@ -12,7 +12,7 @@ class Reranker:
     using three possible approaches: cross-encoder, TF-IDF, or a hybrid of both.
     """
 
-    def __init__(self, type, cross_encoder_model_name='cross-encoder/ms-marco-MiniLM-L-6-v2'):
+    def __init__(self, type, corpus, cross_encoder_model_name='cross-encoder/ms-marco-MiniLM-L-6-v2'):
         """
         Initializes the Reranker class with specified reranking type and model name.
 
@@ -20,11 +20,16 @@ class Reranker:
         :param cross_encoder_model_name: A string specifying the cross-encoder model name (default is 'cross-encoder/ms-marco-MiniLM-L-6-v2').
         """
         self.type = type
+        self.corpus = corpus
         self.cross_encoder_model_name = cross_encoder_model_name
         self.cross_encoder_model = AutoModelForSequenceClassification.from_pretrained(cross_encoder_model_name)
         self.tokenizer = AutoTokenizer.from_pretrained(cross_encoder_model_name)
 
-    def rerank(self, query, context, corpus, distance_metric="cosine"):
+        # Initialize vetorization of corpus
+        self.vectorizer = TfidfVectorizer(stop_words='english')
+        self.tfidf_corpus_matrix = self.vectorizer.fit_transform(self.corpus)
+
+    def rerank(self, query, context, distance_metric="cosine"):
         """
         Selects the reranking method based on the initialized type.
 
@@ -42,7 +47,7 @@ class Reranker:
         elif self.type == "sequential":
             return self.sequential_rerank(query, context, distance_metric=distance_metric)
         elif self.type == "tfidf_corpus":
-            return self.tfidf_corpus_rerank(query, corpus, distance_metric=distance_metric)
+            return self.tfidf_corpus_rerank(query, distance_metric=distance_metric)
 
     def cross_encoder_rerank(self, query, context):
         """
@@ -52,6 +57,9 @@ class Reranker:
         :param context: A list of strings, each representing a document.
         :return: A list of ranked documents, their indices, and relevance scores.
         """
+        if len(context) == 1:
+            return context, [0], [1.0]
+        
         query_document_pairs = [(query, doc) for doc in context]
         inputs = self.tokenizer(query_document_pairs, padding=True, truncation=True, return_tensors="pt")
 
@@ -153,21 +161,18 @@ class Reranker:
 
         return ranked_documents, ranked_indices, scores
 
-    def tfidf_corpus_rerank(self, query, corpus, distance_metric="cosine"):
+    def tfidf_corpus_rerank(self, query, distance_metric="cosine"):
         """
         Reranks documents from the full chunked corpus based on their similarity to the query using TF-IDF and a specified distance metric.
 
         :param query: A string containing the query.
-        :param corpus: A list of strings, each representing a chunked document from the full corpus.
         :param distance_metric: The distance metric to use for similarity calculation ('cosine', 'euclidean', 'manhattan', etc.).
         :return: A list of ranked documents, their indices, and similarity scores.
         """
-        all_texts = [query] + corpus
-        vectorizer = TfidfVectorizer(stop_words='english')
-        tfidf_matrix = vectorizer.fit_transform(all_texts)
+        query_vector = self.vectorizer.transform([query])
 
-        # Calculate distance scores between the query (first vector) and each document
-        distances = pairwise_distances(tfidf_matrix[0:1], tfidf_matrix[1:], metric=distance_metric).flatten()
+        # Calculate distance scores between the query and the corpus
+        distances = pairwise_distances(query_vector, self.tfidf_corpus_matrix, metric=distance_metric).flatten()
         
         # Sort indices in ascending order for similarity metrics (higher is better) and descending for distance
         if distance_metric == "cosine":
@@ -175,7 +180,7 @@ class Reranker:
         else:
             ranked_indices = np.argsort(distances)[::-1]
 
-        ranked_documents = [corpus[idx] for idx in ranked_indices]
+        ranked_documents = [self.corpus[idx] for idx in ranked_indices]
         scores = [distances[idx] for idx in ranked_indices]
 
         return ranked_documents, ranked_indices, scores
@@ -187,8 +192,6 @@ if __name__ == "__main__":
     import faiss
     from indexing import FaissIndex
     from search import FaissSearch
-
-    reranker = Reranker(type="hybrid")
 
     # This is an example from SQuAD dataset. 
     # https://rajpurkar.github.io/SQuAD-explorer/
@@ -204,6 +207,7 @@ if __name__ == "__main__":
         "By mass, oxygen is the third-most abundant element in the universe, after hydrogen and helium.", 
         ]
     
+    reranker = Reranker(corpus=context, type="tfidf_corpus")
 
     # Embed the documents. USE THE embedding.py to implement you system.
     embedding_model = SentenceTransformer('all-MiniLM-L6-v2')

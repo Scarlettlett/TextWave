@@ -7,25 +7,38 @@ from modules.extraction.embedding import Embedding
 from modules.retrieval.indexing import FaissIndex
 from modules.retrieval.search import FaissSearch
 from modules.retrieval.reranker import Reranker
+from modules.generator.question_answering import QA_Generator
 
 class Pipeline:
-    def __init__(self, embedding_model_name='all-MiniLM-L6-v2', index_type='brute_force', **kwargs):
-        self.embedding_model_name = embedding_model_name
-        self.index_type = index_type
-        # Initialize preprocessing, embedding, and indexing
-        self.processor = DocumentProcessing()
-        self.embedder = Embedding(self.embedding_model_name)
-        self.indexer = FaissIndex(self.index_type)
-        self.searcher = None
+    def __init__(self, index_type='brute_force', rerank_type="hybrid", temperature=0.2, generator_model="mistral-large-latest", **kwargs):
 
-        # Get params for initiating searching in method preprocess_corpus
+        # Get params
         self.metric = kwargs.get('metric', 'euclidean')
         self.p = kwargs.get('p', 3)
-        
+        self.embedding_model_name = kwargs.get('embedding_model_name', 'all-MiniLM-L6-v2')
+        self.temperature = temperature
+        self.generator_model = generator_model
+
         self.chunking_strategy = None
         self.fixed_length = None
         self.overlap_size = None
+
+        # Initialize preprocessing, embedding, indexing, reranking, and generating
+        self.processor = DocumentProcessing()
+        self.embedder = Embedding(self.embedding_model_name)
+
+        self.index_type = index_type
+        self.indexer = FaissIndex(self.index_type)
+
+        self.searcher = None
+
         self.corpus = None
+        self.rerank_type = rerank_type
+        self.reranker = None
+        # self.reranker = Reranker(type=self.rerank_type, corpus=self.corpus, cross_encoder_model_name='cross-encoder/ms-marco-MiniLM-L-6-v2')
+
+        self.generator = QA_Generator(api_key = os.environ["MISTRAL_API_KEY"], temperature=self.temperature, generator_model=self.generator_model)
+ 
 
     def preprocess_corpus(self, corpus_directory, chunking_strategy='sentence', fixed_length=None, overlap_size=2):
         """Chunk each file in the corpus directory, embed each chunk, and store chunks"""
@@ -61,6 +74,17 @@ class Pipeline:
 
         #5. Update self.corpus to a list of all chunked documents
         self.corpus = document_chunks
+
+    def load_index(self, faiss_path: str, metadata_path: str):
+        self.indexer.metadata = None
+        self.indexer.load(faiss_path=faiss_path, metadata_path=metadata_path)
+
+        self.corpus = self.indexer.metadata
+        # Init searcher with self.index not None
+        self.searcher = FaissSearch(self.indexer, self.metric, self.p)
+
+        # Init reranker with self.corpus not None
+        self.reranker = Reranker(type=self.rerank_type, corpus=self.corpus, cross_encoder_model_name='cross-encoder/ms-marco-MiniLM-L-6-v2')
     
     def index_reporting(self):
         vector_number = len(self.indexer.metadata)
@@ -74,12 +98,16 @@ class Pipeline:
 
         return self.chunking_strategy, self.fixed_length, self.overlap_size, vector_number
     
-    def search_rerank(self, query, k, type="hybrid", reporting=True):
+    def __encode(self, query):
         # Preprocess the query
         query = query.strip()
         query_reshaped = nltk.sent_tokenize(query)
         # Embed the query
-        query_embedding = self.embedder.encode(query_reshaped)
+        return self.embedder.encode(query_reshaped)
+
+    def search_rerank(self, query, k, type="hybrid", reporting=True):
+        # Embed the query
+        query_embedding = self.__encode(query)
         
         # Search the query
         distances_ivf, indices_ivf, metadata_ivf = self.searcher.search(query_embedding, k)
@@ -88,12 +116,12 @@ class Pipeline:
             # Reporting the search results
             print("QUERY:", query)
             print("\nNEAREST NEIGHBORS RESULTS:")
-            for i in range(5):
+            for i in range(k):
                 print(f"Neighbor {i+1}: Index {indices_ivf[0][i]}, Distance {distances_ivf[0][i]}, Documents: {metadata_ivf[i]}")
 
         # Initiate reranker from retrival module
-        self.reranker = Reranker(type=type, cross_encoder_model_name='cross-encoder/ms-marco-MiniLM-L-6-v2')
-        ranked_documents, ranked_indices, scores = self.reranker.rerank(query, context=metadata_ivf, corpus=self.corpus)
+        self.reranker = Reranker(type=type, corpus=self.corpus, cross_encoder_model_name='cross-encoder/ms-marco-MiniLM-L-6-v2')
+        ranked_documents, ranked_indices, scores = self.reranker.rerank(query, context=metadata_ivf, distance_metric="cosine")
 
         if reporting:
             # Reporting the reranked results
@@ -102,6 +130,45 @@ class Pipeline:
                 print(f"Rerank Document {i+1}: Scores {scores[i]}, Documents: {ranked_documents[i]}")
         
         return ranked_documents, ranked_indices, scores
+    
+    def search_neighbors(self, query_embedding, k=10, reporting=True):
+        query_embedding_vector = self.__encode(query_embedding)
+        # Search the query
+        distances_ivf, indices_ivf, metadata_ivf = self.searcher.search(query_embedding_vector, k)
+        
+        if reporting:
+            # Reporting the search results
+            print("QUERY:", query_embedding)
+            print("\nNEAREST NEIGHBORS RESULTS:")
+            for i in range(k):
+                print(f"Neighbor {i+1}: Index {indices_ivf[0][i]}, Distance {distances_ivf[0][i]}, Documents: {metadata_ivf[i]}")
+        
+        return metadata_ivf
+    
+    def generate_answer(self, query, context, rerank=True, reporting=True):
+        import time
+        from mistralai.models import SDKError
+
+        if rerank:
+            retrived_documents,_,_ = self.reranker.rerank(query=query, context=context, distance_metric="cosine")
+        else:
+            retrived_documents = context
+
+        # Use QA_generator to generate an answer
+        try:
+            generated_answer = self.generator.generate_answer(query, retrived_documents)
+        except SDKError as e:
+            if e.status_code == 429:  # Rate limit error
+                print("Rate limit exceeded. Waiting for 10 seconds before retrying...")
+                time.sleep(10)  # Wait before retrying
+                generated_answer = self.generator.generate_answer(query, retrived_documents)
+
+        if reporting:
+            # Reporting the search results
+            print("QUERY:", query)
+            print("\nGENERATED ANSWER:", generated_answer)
+
+        return generated_answer
 
     
 
@@ -109,10 +176,14 @@ if __name__ == "__main__":
     corpus_dir = "storage\\sample_corpus"
     sample_faiss_path = "storage\\index\\faiss_index.bin"
     sample_metadata_path = "storage\\index\\metadata.pkl"
-    pipeline = Pipeline(embedding_model_name='all-MiniLM-L6-v2', index_type='brute_force')
+    pipeline = Pipeline(index_type='brute_force')
     # pipeline.preprocess_corpus(paragraph_dir, chunking_strategy='fixed-length', fixed_length=50, overlap_size=3)
-    pipeline.preprocess_corpus(corpus_dir, chunking_strategy='sentence', fixed_length=60, overlap_size=1)
+    # pipeline.preprocess_corpus(corpus_dir, chunking_strategy='sentence', fixed_length=60, overlap_size=1)
+    pipeline.load_index(sample_faiss_path, sample_metadata_path)
     # pipeline.index_reporting()
     # pipeline.indexer.save(sample_faiss_path,sample_metadata_path)
     query = "When did Lincoln begin his political career?"
-    pipeline.search_rerank(query, k=5, type="sequential")
+    retrived_docs = pipeline.search_neighbors(query, k=1, reporting=False)
+
+    # Use QA generator to generate answer
+    pipeline.generate_answer(query, retrived_docs)
