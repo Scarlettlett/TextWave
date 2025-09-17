@@ -14,10 +14,11 @@ class FaissIndex:
         # self.vector_dimension = vectors.shape[1]
         self.index_type = index_type
         self.index_params = kwargs  # Contains variable-length keyword arguments for index customization
-
+        self.nlist = self.index_params.get('nlist', 20)  # Number of clusters
         self.metadata = []  # Store metadata for each point
-
+        self.pending_vectors = [] # Store vectors until training is possible
         self.index = None
+        self.direct_map_enabled = False
     
     def _create_index(self):
         """
@@ -28,7 +29,7 @@ class FaissIndex:
         
         elif self.index_type == 'IVF':
             quantizer = self.index_params.get('quantizer', faiss.IndexFlat(self.vector_dimension))
-            nlist = self.index_params.get('nlist', 100)  # Number of clusters
+            nlist = self.index_params.get('nlist', 20)  # Number of clusters
             return faiss.IndexIVFFlat(quantizer, self.vector_dimension, nlist)
         
         elif self.index_type == 'IVFPQ':
@@ -83,10 +84,28 @@ class FaissIndex:
             raise ValueError(f"New vector must have {self.vector_dimension} dimensions.")
         
         # Train index if necessary (for IVF, PQ, IVFSQ, etc.)
-        if isinstance(self.index, (faiss.IndexIVF, faiss.IndexPQ, faiss.IndexIVFScalarQuantizer)):
-            self.index.train(new_vector)
+        # if isinstance(self.index, (faiss.IndexIVF, faiss.IndexPQ, faiss.IndexIVFScalarQuantizer)):
+        #     self.index.train(new_vector)
         
-        self.index.add(new_vector)
+        # self.index.add(new_vector)
+        if isinstance(self.index, (faiss.IndexIVF, faiss.IndexPQ, faiss.IndexIVFScalarQuantizer, faiss.IndexIVFPQ)):
+            self.pending_vectors.append(new_vector)
+            if len(self.pending_vectors) >= self.nlist:
+                # Train the index once we have enough vectors
+                all_vectors = np.vstack(self.pending_vectors)
+                self.index.train(all_vectors)
+                self.index.add(all_vectors)
+                self.pending_vectors.clear()  # Clear pending vectors after adding to index
+
+                # Enable direct map after adding vectors, if IVF type
+                if isinstance(self.index, (faiss.IndexIVFFlat, faiss.IndexIVFPQ)) and not self.direct_map_enabled:
+                    self.index.make_direct_map()
+                    # print("Enabling direct map for IVF index.")
+                    self.direct_map_enabled = True
+
+            # self.index.train(new_vector)
+        else:
+            self.index.add(new_vector)
 
         if metadata is not None:
             if isinstance(metadata, list):
